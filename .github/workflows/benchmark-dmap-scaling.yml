@@ -1,0 +1,114 @@
+name: Dense DMAP versus FlashDiffusion scaling
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: Run all five sizes on a configured self-hosted GPU runner
+        default: false
+        type: boolean
+      repeats:
+        description: Repetitions per method and N
+        default: '3'
+        required: true
+        type: string
+      timeout:
+        description: Seconds per trial (including setup and warm-up)
+        default: '3600'
+        required: true
+        type: string
+  push:
+    branches: ['main', 'benchmark/dense-vs-flash-scaling']
+    paths:
+      - benchmarks/benchmark_dmap_scaling.py
+      - .github/workflows/benchmark-dmap-scaling.yml
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "flashdiffusion @ git+https://github.com/sparsetrace/FlashDiffusion.git@f5c2d1abb7e418829651f7e2fedbb8b323fd56f9" matplotlib psutil
+      - name: Validate dense and tiled operators and eigenpairs
+        run: python benchmarks/benchmark_dmap_scaling.py --device cpu --sizes 100 1000 --repeats 3 --timeout 300 --output smoke_results
+      - name: Check conservative memory screening
+        run: |
+          python benchmarks/benchmark_dmap_scaling.py --device cpu --sizes 100 --repeats 1 --dense-max-gib 0.00001 --timeout 300 --output memory_check
+          python - <<'PYTEST'
+          import json
+          from pathlib import Path
+          rows = json.loads(Path('smoke_results/results.json').read_text())['trials']
+          assert len(rows) == 12 and all(r['status'] == 'ok' for r in rows)
+          limited = json.loads(Path('memory_check/results.json').read_text())['trials']
+          assert limited[0]['method'] == 'dense' and limited[0]['status'] == 'memory_limit'
+          assert limited[0]['seconds'] is None
+          assert limited[1]['method'] == 'flash' and limited[1]['status'] == 'ok'
+          print('PASS: 12/12 numerical trials; dense memory screening; Flash continues')
+          PYTEST
+      - name: Record validation environment
+        if: always()
+        run: |
+          mkdir -p smoke_results
+          git rev-parse HEAD > smoke_results/commit.txt
+          python -m pip freeze > smoke_results/packages.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dmap-scaling-smoke
+          path: |
+            smoke_results/
+            memory_check/
+          if-no-files-found: warn
+
+  scaling:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
+    needs: smoke
+    # Register a runner with these labels. It must have NVIDIA drivers,
+    # a matching CUDA toolkit (nvcc), Python 3.11+, and CUDA-enabled PyTorch.
+    # Ordinary ubuntu-latest runners do not have a GPU. No CPU fallback allowed.
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 1800
+    env:
+      REPEATS: ${{ inputs.repeats || '3' }}
+      TRIAL_TIMEOUT: ${{ inputs.timeout || '3600' }}
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check GPU and compiler
+        run: |
+          nvidia-smi
+          nvcc --version
+          python -c "import torch; assert torch.cuda.is_available(), 'CUDA-enabled PyTorch is required'; print(torch.__version__, torch.cuda.get_device_name())"
+      - name: Install benchmark dependencies
+        run: python -m pip install "flashdiffusion @ git+https://github.com/sparsetrace/FlashDiffusion.git@f5c2d1abb7e418829651f7e2fedbb8b323fd56f9" matplotlib psutil
+      - name: Record source and hardware
+        run: |
+          mkdir -p benchmark_results
+          git rev-parse HEAD > benchmark_results/commit.txt
+          nvidia-smi -q > benchmark_results/gpu.txt
+          python -m pip freeze > benchmark_results/packages.txt
+      - name: Run all five sizes
+        run: >-
+          python benchmarks/benchmark_dmap_scaling.py
+          --device cuda --sizes 100 1000 10000 100000 1000000
+          --repeats "$REPEATS" --timeout "$TRIAL_TIMEOUT"
+          --output benchmark_results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dmap-scaling-results
+          path: benchmark_results/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+benchmark_results/
+smoke_results/
+memory_check/

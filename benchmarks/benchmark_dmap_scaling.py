@@ -17,7 +17,7 @@ in a subprocess. No sparse approximation, subsampling or extrapolated times.
 
 Dense memory screening uses a conservative 3*N*N*itemsize workspace estimate,
 NOT a measured peak or a proof of OOM. Omitted/failed trials have no timing point.
-The default sizes are 100, 1000, 10000, 100000, 1000000. Large matrix-free runs
+The default sizes are 100, 1000, 10000, 100000, 1000000, 10000000. Large matrix-free runs
 still require quadratic arithmetic and can time out. Partial outputs are saved
 after every trial. CPU mode is intended for small correctness/smoke tests.
 """
@@ -36,7 +36,7 @@ import time
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--sizes', nargs='+', type=int, default=[100, 1000, 10000, 100000, 1000000])
+    p.add_argument('--sizes', nargs='+', type=int, default=[100, 1000, 10000, 100000, 1000000, 10000000])
     p.add_argument('--device', choices=['cpu', 'cuda'], default='cuda')
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--seed', type=int, default=42)

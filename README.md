@@ -45,15 +45,49 @@ budget screens infeasible cases; no timing is fabricated for omitted, timed-out,
 failed or numerically invalid trials. Matrix-free computation remains quadratic
 in arithmetic. See the Python module docstring for full protocol details.
 
-## GitHub Actions
+## GitHub Actions and Modal T4
 
-Pushes to main or benchmark/dense-vs-flash-scaling run CPU smoke tests and upload
-their results. For all five sizes, select Actions > Dense DMAP versus
-FlashDiffusion scaling > Run workflow and enable run_gpu. Register a runner with
-labels self-hosted, linux, x64, gpu, and install the NVIDIA driver, matching CUDA
-toolkit and CUDA-enabled PyTorch before launching it. Without this runner the
-GPU job will wait in the queue. GPU execution is opt-in; ordinary hosted CPU
-runners only execute the small validation.
+`.github/workflows/benchmark-dmap-scaling.yml` runs the CPU tests first and then
+launches Modal from an ordinary `ubuntu-latest` runner. The remote function in
+`benchmarks/modal_t4.py` requests exactly one **T4**, asserts its actual GPU name
+and SM75 capability, and never substitutes another GPU or silently falls back
+to CPU. No self-hosted GPU runner is required.
+
+Create the following repository **Actions secrets** before running the GPU job:
+
+- `MODAL_TOKEN_ID`
+- `MODAL_TOKEN_SECRET`
+
+Use Settings > Secrets and variables > Actions. Credentials never belong in
+source files, workflow inputs, logs or commits. Pushes to main affecting benchmark
+files launch the pipeline. Alternatively select Actions > Dense DMAP versus
+FlashDiffusion scaling > Run workflow, enable run_gpu, and set repetitions and
+trial timeout. Missing authentication causes an explicit failure, not a success.
+
+Modal first validates N=100 and 1000 using both GPU operators. Only if all four
+preflight trials pass does it attempt N=100, 1000, 10000, 100000, 1000000 and
+10000000. Defaults are three repetitions and 120 seconds per subprocess; inputs
+are limited to 1-3 repetitions and 1-300 seconds. The deadline includes process
+startup/warm-up, whereas reported timings exclude setup. A timeout is not a
+measurement and produces no point on the timing curve. Modal tasks consume the
+configured account's GPU resources; retries are disabled.
+
+The T4 is SM75. The pinned upstream JIT builder does not contain an SM75 entry;
+this project's Modal image adds that architecture mapping to compile the SAME
+upstream WMMA kernel for sm_75. The CUDA source and mathematical operator are
+unchanged. The patch is checked against the expected source layout, and real
+GPU preflight checks are required before scaling. Compilation or numerical
+failure stops large-N work and preserves the diagnostic files.
+
+The image pins CUDA 12.4.1, PyTorch 2.5.1/cu124 and the upstream commit. Artifacts
+include GPU identification, package versions, the CUDA source hash, benchmark
+commit, trial statuses and output figures. GPU artifacts are uploaded as
+`dmap-scaling-modal-t4`. CPU validation artifacts retain their separate name.
+
+N=10,000,000 is an experimental attempt, not a demonstrated supported size.
+One dense FP32 matrix at this size alone requires 400 TB. FlashDiffusion avoids
+that matrix but still evaluates quadratic interactions, so it may exceed the
+configured deadline on a T4.
 
 ## Provenance and validation
 
@@ -62,10 +96,6 @@ This is a new benchmark project. No files or results from the inaccessible
 public `sparsetrace/FlashDiffusion` library at the commit pinned above.
 
 The YAML itself runs 12 numerical CPU trials (N=100 and 1000, both methods,
-three repetitions) followed by a memory-screening check. It asserts the trial
-statuses and preserves JSON, CSV, PDF, PNG, logs and environment metadata as
-GitHub Actions artifacts. Consult the actual Actions run for its outcome.
-Local preparation results are not presented as GitHub or GPU results.
-
-Full GPU scaling remains a separate workflow job, enabled with run_gpu.
-Missing points due to memory screening or timeout are explicitly reported.
+three repetitions) followed by a memory-screening check. Consult the actual
+Actions run and Modal artifacts for their outcomes. CPU checks are not GPU
+measurements; adding a T4 build configuration is not evidence that it has run.

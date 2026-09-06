@@ -36,7 +36,7 @@ import time
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--sizes', nargs='+', type=int, default=[100, 1000, 10000, 100000, 1000000, 10000000])
+    p.add_argument('--sizes', nargs='+', type=int, default=[10,100, 1000, 10000, 100000, 1000000, 10000000])
     p.add_argument('--device', choices=['cpu', 'cuda'], default='cuda')
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--seed', type=int, default=42)

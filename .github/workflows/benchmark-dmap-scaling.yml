@@ -3,6 +3,10 @@ name: Dense DMAP versus FlashDiffusion scaling
 on:
   workflow_dispatch:
     inputs:
+      collect_call_id:
+        description: Optional Modal call ID to collect without waiting or submitting a new run
+        default: ''
+        type: string
       run_gpu:
         description: Run all six sizes on Modal using exactly one T4
         default: false
@@ -13,7 +17,7 @@ on:
         required: true
         type: string
       timeout:
-        description: Seconds per trial (including setup and warm-up)
+        description: Dense timeout only; FlashDiffusion has no subprocess deadline
         default: '120'
         required: true
         type: string
@@ -44,7 +48,7 @@ jobs:
         run: python benchmarks/benchmark_dmap_scaling.py --device cpu --sizes 100 1000 --repeats 3 --timeout 300 --output smoke_results
       - name: Check conservative memory screening
         run: |
-          python benchmarks/benchmark_dmap_scaling.py --device cpu --sizes 100 --repeats 1 --dense-max-gib 0.00001 --timeout 300 --output memory_check
+          python benchmarks/benchmark_dmap_scaling.py --device cpu --sizes 100 --repeats 1 --dense-mode full --dense-max-gib 0.00001 --timeout 300 --output memory_check
           python - <<'PYTEST'
           import json
           from pathlib import Path
@@ -54,7 +58,26 @@ jobs:
           assert limited[0]['method'] == 'dense' and limited[0]['status'] == 'memory_limit'
           assert limited[0]['seconds'] is None
           assert limited[1]['method'] == 'flash' and limited[1]['status'] == 'ok'
-          print('PASS: 12/12 numerical trials; dense memory screening; Flash continues')
+          import importlib.util
+          import numpy as np
+          from types import SimpleNamespace
+          spec = importlib.util.spec_from_file_location('bench', 'benchmarks/benchmark_dmap_scaling.py')
+          bench = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(bench)
+          x = np.random.default_rng(5).normal(size=(103, 3))
+          x -= x.mean(0)
+          cfg = SimpleNamespace(device='cpu', block_size=17, beta=1., alpha=.5)
+          mv, degree, _ = bench.batched_dense_operator(x, cfg)
+          sq = (x*x).sum(1)
+          k = np.exp(-np.maximum(sq[:, None]+sq[None, :]-2*x@x.T, 0))
+          w = k.sum(1)**(-cfg.alpha)
+          ka = w[:, None]*k*w[None, :]
+          d = ka.sum(1)
+          matrix = ka/np.sqrt(d[:, None]*d[None, :])
+          v = np.random.default_rng(6).normal(size=len(x))
+          np.testing.assert_allclose(degree, d, rtol=1e-12, atol=1e-12)
+          np.testing.assert_allclose(mv(v), matrix@v, rtol=1e-12, atol=1e-12)
+          print('PASS: 12/12 trials; full memory guard; exact batched/full agreement')
           PYTEST
       - name: Record validation environment
         if: always()
@@ -72,7 +95,7 @@ jobs:
           if-no-files-found: warn
 
   scaling:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.run_gpu)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.run_gpu || inputs.collect_call_id != '')
     needs: smoke
     runs-on: ubuntu-latest
     timeout-minutes: 240
@@ -94,12 +117,20 @@ jobs:
           fi
       - name: Install Modal client
         run: python -m pip install modal==1.5.5
-      - name: Run GPU preflight and six-size experiment on Modal T4
+      - name: Deploy Modal T4 worker
+        if: inputs.collect_call_id == ''
+        run: python -m modal deploy benchmarks/modal_t4.py
+      - name: Submit benchmark without waiting for GPU completion
+        if: inputs.collect_call_id == ''
         run: >-
-          python -m modal run benchmarks/modal_t4.py
-          --sizes 100,1000,10000,100000,1000000,10000000
+          python benchmarks/modal_t4.py --submit
           --repeats "$REPEATS" --trial-timeout "$TRIAL_TIMEOUT"
           --source-commit "$GITHUB_SHA" --output modal_results
+      - name: Collect existing run without waiting
+        if: inputs.collect_call_id != ''
+        env:
+          CALL_ID: ${{ inputs.collect_call_id }}
+        run: python benchmarks/modal_t4.py --collect "$CALL_ID" --output modal_results
       - uses: actions/upload-artifact@v4
         if: always()
         with:

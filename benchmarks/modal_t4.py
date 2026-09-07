@@ -14,6 +14,7 @@ import modal
 UPSTREAM = 'f5c2d1abb7e418829651f7e2fedbb8b323fd56f9'
 HERE = Path(__file__).resolve().parent
 app = modal.App('flashdiffusion-tests-t4')
+volume = modal.Volume.from_name('flashdiffusion-t4-results', create_if_missing=True)
 
 
 def configure_sm75():
@@ -43,9 +44,9 @@ image = (
 )
 
 
-@app.function(image=image, gpu='T4', cpu=4, memory=16384, timeout=14400,
+@app.function(image=image, gpu='T4', cpu=4, memory=16384, timeout=86400, volumes={'/results': volume},
               retries=0, max_containers=1)
-def run_benchmark(sizes: list[int], repeats: int, trial_timeout: int, source_commit: str):
+def run_benchmark(sizes: list[int], repeats: int, trial_timeout: int, source_commit: str, run_id: str):
     import hashlib
     import importlib.util
     import subprocess
@@ -53,8 +54,8 @@ def run_benchmark(sizes: list[int], repeats: int, trial_timeout: int, source_com
     import torch
     from pathlib import Path
 
-    root = Path('/tmp/t4-results')
-    root.mkdir(exist_ok=True)
+    root = Path('/results') / run_id
+    root.mkdir(parents=True, exist_ok=True)
     gpu = torch.cuda.get_device_name(0)
     capability = torch.cuda.get_device_capability(0)
     if 'T4' not in gpu or capability != (7, 5):
@@ -67,15 +68,25 @@ def run_benchmark(sizes: list[int], repeats: int, trial_timeout: int, source_com
         benchmark_commit=source_commit, upstream_commit=UPSTREAM, gpu=gpu,
         capability=capability, source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         adaptation='JIT architecture mapping SM75; upstream CUDA source unchanged',
-        requested_sizes=sizes, repeats=repeats, per_worker_timeout_seconds=trial_timeout,
+        requested_sizes=sizes, repeats=repeats, dense_timeout_seconds=trial_timeout, flash_timeout_seconds=None,
+        modal_function_limit_seconds=86400, dense_mode="batched", block_size=2048,
     ), indent=2))
 
     def execute(name, requested, count, deadline):
         cmd = [sys.executable, '/bench/benchmark_dmap_scaling.py', '--device', 'cuda',
                '--sizes', *map(str, requested), '--repeats', str(count),
-               '--timeout', str(deadline), '--output', str(root/name)]
+               '--timeout', str(deadline), '--flash-timeout', '0', '--dense-mode', 'batched', '--output', str(root/name)]
         with (root/f'{name}.log').open('w') as log:
-            return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
+            import time
+            process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+            while process.poll() is None:
+                volume.commit()  # Persist partial JSON/CSV/figures during long trials.
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    pass
+            volume.commit()
+            return process.returncode
 
     # Includes real CUDA compilation and both dense/Flash agreement checks.
     code = execute('preflight', [100, 1000], 1, 600)
@@ -95,6 +106,8 @@ def run_benchmark(sizes: list[int], repeats: int, trial_timeout: int, source_com
         for path in sorted(root.rglob('*')):
             if path.is_file():
                 archive.write(path, path.relative_to(root))
+    (root/'modal-t4-results.zip').write_bytes(buffer.getvalue())
+    volume.commit()
     return code, buffer.getvalue()
 
 
@@ -110,7 +123,7 @@ def main(sizes: str = '100,1000,10000,100000,1000000,10000000', repeats: int = 3
     if not source_commit:
         import subprocess
         source_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-    code, payload = run_benchmark.remote(requested, repeats, trial_timeout, source_commit)
+    code, payload = run_benchmark.remote(requested, repeats, trial_timeout, source_commit, __import__('uuid').uuid4().hex)
     folder = Path(output)
     folder.mkdir(parents=True, exist_ok=True)
     (folder/'modal-t4-results.zip').write_bytes(payload)
@@ -123,3 +136,41 @@ def main(sizes: str = '100,1000,10000,100000,1000000,10000000', repeats: int = 3
     print(f'T4 artifacts saved to {folder}; exit_code={code}')
     if code:
         raise SystemExit(code)
+
+
+if __name__ == '__main__':
+    import argparse
+    import uuid
+    p = argparse.ArgumentParser()
+    p.add_argument('--submit', action='store_true')
+    p.add_argument('--collect', default='')
+    p.add_argument('--repeats', type=int, default=3)
+    p.add_argument('--trial-timeout', type=int, default=120, help='Dense deadline only')
+    p.add_argument('--source-commit', default='')
+    p.add_argument('--output', default='modal_results')
+    args = p.parse_args()
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    if args.submit:
+        if not 1 <= args.repeats <= 3 or not 1 <= args.trial_timeout <= 300:
+            p.error('Use 1-3 repeats and a dense deadline of 1-300 seconds')
+        run_id = uuid.uuid4().hex
+        fn = modal.Function.from_name('flashdiffusion-tests-t4', 'run_benchmark')
+        call = fn.spawn([100,1000,10000,100000,1000000,10000000], args.repeats,
+                        args.trial_timeout, args.source_commit, run_id)
+        receipt = dict(call_id=call.object_id, volume='flashdiffusion-t4-results',
+                       run_directory=run_id, status='submitted', source_commit=args.source_commit)
+        (out/'submission.json').write_text(json.dumps(receipt, indent=2))
+        print(json.dumps(receipt))
+    elif args.collect:
+        try:
+            code, payload = modal.FunctionCall.from_id(args.collect).get(timeout=0)
+        except TimeoutError:
+            (out/'pending.json').write_text(json.dumps(dict(call_id=args.collect, status='pending')))
+            print('Still running; no wait performed. Partial results are in the Modal volume.')
+        else:
+            (out/'modal-t4-results.zip').write_bytes(payload)
+            print(f'Collected result; exit_code={code}')
+            raise SystemExit(code)
+    else:
+        p.error('Use --submit or --collect CALL_ID')

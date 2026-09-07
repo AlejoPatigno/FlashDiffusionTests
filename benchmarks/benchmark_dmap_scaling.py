@@ -13,9 +13,11 @@ FlashDiffusion uses its native mixed precision. CPU paths use package defaults.
 Time includes centering, transfers, kernel/normalisation, eigenpairs and diffusion
 coordinates. Data generation, imports/JIT, small warm-up, validation and plotting
 are excluded. Synchronisation brackets each measurement. Each trial is isolated
-in a subprocess. No sparse approximation, subsampling or extrapolated times.
+in a subprocess. Flash has no subprocess deadline by default (--flash-timeout 0). No sparse approximation, subsampling or extrapolated times.
 
-Dense memory screening uses a conservative 3*N*N*itemsize workspace estimate,
+Dense defaults to exact all-pairs block reductions, recomputed per matvec.
+Use --dense-mode full to retain a complete matrix. Memory screening estimates
+3*block_size**2 + 32*N elements for batched mode or 3*N*N for full mode,
 NOT a measured peak or a proof of OOM. Omitted/failed trials have no timing point.
 The default sizes are 100, 1000, 10000, 100000, 1000000, 10000000. Large matrix-free runs
 still require quadratic arithmetic and can time out. Partial outputs are saved
@@ -47,6 +49,9 @@ def arguments():
     p.add_argument('--maxiter', type=int, default=1000)
     p.add_argument('--validation-tol', type=float, default=5e-3)
     p.add_argument('--timeout', type=int, default=3600, help='Seconds per subprocess, including JIT/warm-up')
+    p.add_argument('--flash-timeout', type=int, default=0, help='Flash subprocess deadline; 0 disables it')
+    p.add_argument('--dense-mode', choices=['batched', 'full'], default='batched')
+    p.add_argument('--block-size', type=int, default=2048)
     p.add_argument('--memory-fraction', type=float, default=0.6)
     p.add_argument('--dense-max-gib', type=float, default=0, help='Additional memory estimate cap; 0 uses available memory')
     p.add_argument('--output', type=Path, default=Path('benchmark_results'))
@@ -57,9 +62,55 @@ def arguments():
     if (min(a.sizes) <= a.components or a.components < 2 or a.repeats < 1
             or a.timeout < 1 or a.maxiter < 1 or a.beta <= 0 or a.tol <= 0
             or a.validation_tol <= 0 or not 0 < a.memory_fraction < 1
-            or a.dense_max_gib < 0):
+            or a.dense_max_gib < 0 or a.flash_timeout < 0 or a.block_size < 1):
         p.error('Invalid sizes, components, repetitions, tolerance, timeout or memory budget')
     return a
+
+
+
+def batched_dense_operator(x, a):
+    """Exact all-pairs Gaussian reductions; O(N + block_size**2) operator storage.
+
+    Materializes dense blocks, recomputing them for every reduction/matvec.
+    This changes the storage/computation tradeoff, not the DMAP operator.
+    """
+    import numpy as np
+    gpu = a.device == 'cuda'
+    if gpu:
+        import torch
+    z = torch.as_tensor(x, dtype=torch.float32, device='cuda') if gpu else np.asarray(x, dtype=np.float64)
+    n, block = len(z), a.block_size
+    sq = (z*z).sum(axis=1)
+    def zeros():
+        return torch.zeros(n, device='cuda', dtype=torch.float32) if gpu else np.zeros(n)
+    def reduce(weights=None):
+        out = zeros()
+        for i in range(0, n, block):
+            end_i = min(i+block, n)
+            for j in range(0, n, block):
+                end_j = min(j+block, n)
+                k = z[i:end_i] @ z[j:end_j].T
+                k *= -2
+                k += sq[i:end_i, None]
+                k += sq[None, j:end_j]
+                if gpu:
+                    k.clamp_(min=0).mul_(-a.beta).exp_()
+                else:
+                    np.maximum(k, 0, out=k)
+                    k *= -a.beta
+                    np.exp(k, out=k)
+                out[i:end_i] += k.sum(axis=1) if weights is None else k @ weights[j:end_j]
+        return out
+    q = reduce()
+    w = q ** (-a.alpha)
+    degree = w * reduce(w)
+    scale = w * degree ** (-0.5)
+    def mv(v):
+        v = torch.as_tensor(v, device='cuda', dtype=torch.float32) if gpu else np.asarray(v, dtype=np.float64)
+        out = scale * reduce(scale*v)
+        return out.cpu().numpy().astype(np.float64) if gpu else out
+    degree_numpy = degree.cpu().numpy().astype(np.float64) if gpu else degree
+    return mv, degree_numpy, ('torch-dense-batched-fp32' if gpu else 'numpy-dense-batched-fp64')
 
 
 def worker(a):
@@ -94,6 +145,8 @@ def worker(a):
             backend = type(dm._cuda_state).__name__ if dm._cuda_state is not None else 'numpy-tiled'
             return dm.matvec, dm.D_alpha_, backend
         x = x - x.mean(0)
+        if a.dense_mode == 'batched':
+            return batched_dense_operator(x, a)
         if a.device == 'cuda':
             z = torch.as_tensor(x, dtype=torch.float32, device='cuda')
             sq = (z*z).sum(1)
@@ -152,7 +205,9 @@ def worker(a):
         budget = available * a.memory_fraction
         if a.dense_max_gib:
             budget = min(budget, a.dense_max_gib * 2**30)
-        estimate = 3*n*n*(4 if a.device == 'cuda' else 8)
+        itemsize = 4 if a.device == 'cuda' else 8
+        estimate = (3*n*n if a.dense_mode == 'full' else 3*min(n, a.block_size)**2 + 32*n) * itemsize
+        row.update(dense_mode=a.dense_mode, block_size=a.block_size)
         row.update(dense_estimated_bytes=estimate, dense_budget_bytes=int(budget))
         if a.worker == 'dense' and estimate > budget:
             row.update(status='memory_limit', reason='Conservative dense workspace estimate exceeds configured budget')
@@ -203,7 +258,7 @@ def save(a, rows):
         writer.writerows(rows)
     fig, ax = plt.subplots(figsize=(9, 6))
     table = []
-    for method, label, color in [('dense', 'DMAP dense', '#235789'), ('flash', 'FlashDiffusion', '#c44b28')]:
+    for method, label, color in [('dense', 'DMAP dense (batched)' if a.dense_mode == 'batched' else 'DMAP dense (full)', '#235789'), ('flash', 'FlashDiffusion', '#c44b28')]:
         med, lo, hi, status = [], [], [], []
         for n in a.sizes:
             selected = [r for r in rows if r['method']==method and r['n']==n]
@@ -246,21 +301,22 @@ def main(a):
                 result = a.output/f'{method}_{n}_{trial}.json'
                 result.unlink(missing_ok=True)
                 cmd = [sys.executable, str(Path(__file__).resolve()), '--worker', method, '--sizes', str(n), '--trial', str(trial), '--result', str(result.resolve())]
-                for key in ['device', 'seed', 'beta', 'alpha', 'components', 'tol', 'maxiter', 'validation_tol', 'memory_fraction', 'dense_max_gib']:
+                for key in ['device', 'seed', 'beta', 'alpha', 'components', 'tol', 'maxiter', 'validation_tol', 'memory_fraction', 'dense_max_gib', 'dense_mode', 'block_size']:
                     cmd += ['--'+key.replace('_', '-'), str(getattr(a, key))]
                 env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
                 if a.device == 'cpu':
                     env['CUDA_VISIBLE_DEVICES'] = ''
                 row = dict(method=method, n=n, trial=trial, status='error', seconds=None)
+                deadline = (a.flash_timeout or None) if method == 'flash' else a.timeout
                 with (a.output/f'{method}_{n}_{trial}.log').open('w') as log:
                     try:
-                        completed = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=a.timeout)
+                        completed = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=deadline)
                         if completed.returncode == 0 and result.exists():
                             row = json.loads(result.read_text())
                         else:
                             row['reason'] = f'Worker exit {completed.returncode}; inspect log (signal termination is not assumed to be OOM)'
                     except subprocess.TimeoutExpired:
-                        row.update(status='timeout', reason=f'Worker exceeded {a.timeout}s including setup/warm-up')
+                        row.update(status='timeout', reason=f'Worker exceeded {deadline}s including setup/warm-up')
                 rows.append(row)
                 # Check agreement on small paired cases, outside measured regions.
                 pairs = [r for r in rows if r['n']==n and r['trial']==trial and r['status']=='ok']

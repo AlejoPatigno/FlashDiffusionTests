@@ -68,7 +68,7 @@ def run_benchmark(sizes: list[int], repeats: int, trial_timeout: int, source_com
         benchmark_commit=source_commit, upstream_commit=UPSTREAM, gpu=gpu,
         capability=capability, source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         adaptation='JIT architecture mapping SM75; upstream CUDA source unchanged',
-        requested_sizes=sizes, repeats=repeats, dense_timeout_seconds=trial_timeout, flash_timeout_seconds=None,
+        requested_sizes=sizes, repeats=repeats, dense_timeout_seconds=trial_timeout or None, flash_timeout_seconds=None,
         modal_function_limit_seconds=86400, dense_mode="batched", block_size=2048,
     ), indent=2))
 
@@ -113,13 +113,13 @@ def run_benchmark(sizes: list[int], repeats: int, trial_timeout: int, source_com
 
 @app.local_entrypoint()
 def main(sizes: str = '100,1000,10000,100000,1000000,10000000', repeats: int = 3,
-         trial_timeout: int = 120, output: str = 'modal_results', source_commit: str = ''):
+         trial_timeout: int = 0, output: str = 'modal_results', source_commit: str = ''):
     requested = [int(n) for n in sizes.split(',')]
     allowed = {100, 1000, 10000, 100000, 1000000, 10000000}
     if not requested or not set(requested) <= allowed or len(set(requested)) != len(requested):
         raise ValueError('Sizes must be distinct powers of ten from 100 to 10000000')
-    if not 1 <= repeats <= 3 or not 1 <= trial_timeout <= 300:
-        raise ValueError('Use 1-3 repetitions and 1-300 seconds per worker')
+    if not 1 <= repeats <= 3 or not 0 <= trial_timeout <= 300:
+        raise ValueError('Use 1-3 repetitions and 0-300 seconds for dense (0 disables deadline)')
     if not source_commit:
         import subprocess
         source_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
@@ -145,15 +145,15 @@ if __name__ == '__main__':
     p.add_argument('--submit', action='store_true')
     p.add_argument('--collect', default='')
     p.add_argument('--repeats', type=int, default=3)
-    p.add_argument('--trial-timeout', type=int, default=120, help='Dense deadline only')
+    p.add_argument('--trial-timeout', type=int, default=0, help='Dense deadline; 0 disables it')
     p.add_argument('--source-commit', default='')
     p.add_argument('--output', default='modal_results')
     args = p.parse_args()
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     if args.submit:
-        if not 1 <= args.repeats <= 3 or not 1 <= args.trial_timeout <= 300:
-            p.error('Use 1-3 repeats and a dense deadline of 1-300 seconds')
+        if not 1 <= args.repeats <= 3 or not 0 <= args.trial_timeout <= 300:
+            p.error('Use 1-3 repeats and a dense deadline of 0-300 seconds (0 disables it)')
         run_id = uuid.uuid4().hex
         fn = modal.Function.from_name('flashdiffusion-tests-t4', 'run_benchmark')
         call = fn.spawn([100,1000,10000,100000,1000000,10000000], args.repeats,

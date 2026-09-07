@@ -17,8 +17,8 @@ on:
         required: true
         type: string
       timeout:
-        description: Dense timeout only; FlashDiffusion has no subprocess deadline
-        default: '120'
+        description: Dense timeout in seconds; 0 disables it; Flash has no deadline
+        default: '0'
         required: true
         type: string
   push:
@@ -44,6 +44,8 @@ jobs:
         run: |
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install "flashdiffusion @ git+https://github.com/sparsetrace/FlashDiffusion.git@f5c2d1abb7e418829651f7e2fedbb8b323fd56f9" matplotlib psutil
+      - name: Regression check for disabled process deadlines
+        run: python benchmarks/test_deadlines.py
       - name: Validate dense and tiled operators and eigenpairs
         run: python benchmarks/benchmark_dmap_scaling.py --device cpu --sizes 100 1000 --repeats 3 --timeout 300 --output smoke_results
       - name: Check conservative memory screening
@@ -103,7 +105,7 @@ jobs:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       REPEATS: ${{ inputs.repeats || '3' }}
-      TRIAL_TIMEOUT: ${{ inputs.timeout || '120' }}
+      TRIAL_TIMEOUT: ${{ inputs.timeout || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

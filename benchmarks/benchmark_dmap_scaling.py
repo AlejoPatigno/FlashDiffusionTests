@@ -48,7 +48,7 @@ def arguments():
     p.add_argument('--tol', type=float, default=1e-4)
     p.add_argument('--maxiter', type=int, default=1000)
     p.add_argument('--validation-tol', type=float, default=5e-3)
-    p.add_argument('--timeout', type=int, default=3600, help='Seconds per subprocess, including JIT/warm-up')
+    p.add_argument('--timeout', type=int, default=0, help='Dense subprocess deadline in seconds; 0 disables it')
     p.add_argument('--flash-timeout', type=int, default=0, help='Flash subprocess deadline; 0 disables it')
     p.add_argument('--dense-mode', choices=['batched', 'full'], default='batched')
     p.add_argument('--block-size', type=int, default=2048)
@@ -60,7 +60,7 @@ def arguments():
     p.add_argument('--result', type=Path, help=argparse.SUPPRESS)
     a = p.parse_args()
     if (min(a.sizes) <= a.components or a.components < 2 or a.repeats < 1
-            or a.timeout < 1 or a.maxiter < 1 or a.beta <= 0 or a.tol <= 0
+            or a.timeout < 0 or a.maxiter < 1 or a.beta <= 0 or a.tol <= 0
             or a.validation_tol <= 0 or not 0 < a.memory_fraction < 1
             or a.dense_max_gib < 0 or a.flash_timeout < 0 or a.block_size < 1):
         p.error('Invalid sizes, components, repetitions, tolerance, timeout or memory budget')
@@ -307,7 +307,7 @@ def main(a):
                 if a.device == 'cpu':
                     env['CUDA_VISIBLE_DEVICES'] = ''
                 row = dict(method=method, n=n, trial=trial, status='error', seconds=None)
-                deadline = (a.flash_timeout or None) if method == 'flash' else a.timeout
+                deadline = (a.flash_timeout or None) if method == 'flash' else (a.timeout or None)
                 with (a.output/f'{method}_{n}_{trial}.log').open('w') as log:
                     try:
                         completed = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=deadline)

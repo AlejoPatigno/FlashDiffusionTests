@@ -21,7 +21,9 @@ mixed-precision kernel. Both methods share data, normalization and ARPACK settin
 
 ## Timing and deadlines
 
-`--timeout` applies only to dense workers (120 seconds in the workflow).
+`--timeout` applies only to dense workers; its default is now 0 (disabled),
+including the Modal workflow. The small validation job explicitly uses a
+bounded timeout, separate from the large-N experiment.
 `--flash-timeout 0` disables the Flash subprocess deadline; it no longer stops
 at 120 seconds. ARPACK convergence/iteration criteria remain in effect.
 Modal still imposes a 24-hour limit on the complete remote invocation, including
@@ -38,7 +40,7 @@ is unchanged; a checked JIT architecture entry compiles it for SM75.
 
 The remote function gates large work on GPU preflight at N=100 and 1000.
 It then attempts 100, 1000, 10000, 100000, 1000000 and 10000000, three repetitions
-by default. No subprocess deadline is applied to Flash. Failures and unfinished
+by default. No subprocess deadline is applied to either method by default. Failures and unfinished
 trials never receive invented times.
 
 GitHub Actions finishes after submission, not after GPU completion. Its artifact
@@ -59,3 +61,6 @@ Pushes affecting benchmark files on main submit a new GPU run after CPU checks.
 The benchmark branch only performs CPU checks. Manual main runs with run_gpu
 also submit. Modal runs incur the account's GPU usage; max_containers=1 and
 retries=0 prevent parallel GPU workers and automatic computation retries.
+
+The uploaded results diagnosed four dense process timeouts at 120 seconds,
+not ARPACK convergence exceptions. No eigensolver tolerance was relaxed.
